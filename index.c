@@ -1,175 +1,184 @@
-// index.c — Staging area implementation
-//
-// Text format of .pes/index (one entry per line, sorted by path):
-//
-//   <mode-octal> <64-char-hex-hash> <mtime-seconds> <size> <path>
-//
-// Example:
-//   100644 a1b2c3d4e5f6...  1699900000 42 README.md
-//   100644 f7e8d9c0b1a2...  1699900100 128 src/main.c
-//
-// This is intentionally a simple text format. No magic numbers, no
-// binary parsing. The focus is on the staging area CONCEPT (tracking
-// what will go into the next commit) and ATOMIC WRITES (temp+rename).
-//
-// PROVIDED functions: index_find, index_remove, index_status
-// TODO functions:     index_load, index_save, index_add
+// object.c — Content-addressable object store
 
-#include "index.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dirent.h>
+#include <openssl/evp.h>
+#include <errno.h>
 
-// ─── PROVIDED ────────────────────────────────────────────────────────────────
+// ───────────────── PROVIDED ─────────────────
 
-// Find an index entry by path (linear scan).
-IndexEntry* index_find(Index *index, const char *path) {
-    for (int i = 0; i < index->count; i++) {
-        if (strcmp(index->entries[i].path, path) == 0)
-            return &index->entries[i];
+void hash_to_hex(const ObjectID *id, char *hex_out) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
     }
-    return NULL;
+    hex_out[HASH_HEX_SIZE] = '\0';
 }
 
-// Remove a file from the index.
-// Returns 0 on success, -1 if path not in index.
-int index_remove(Index *index, const char *path) {
-    for (int i = 0; i < index->count; i++) {
-        if (strcmp(index->entries[i].path, path) == 0) {
-            int remaining = index->count - i - 1;
-            if (remaining > 0)
-                memmove(&index->entries[i], &index->entries[i + 1],
-                        remaining * sizeof(IndexEntry));
-            index->count--;
-            return index_save(index);
-        }
+int hex_to_hash(const char *hex, ObjectID *id_out) {
+    if (strlen(hex) < HASH_HEX_SIZE) return -1;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
+        id_out->hash[i] = (uint8_t)byte;
     }
-    fprintf(stderr, "error: '%s' is not in the index\n", path);
-    return -1;
-}
-
-// Print the status of the working directory.
-//
-// Identifies files that are staged, unstaged (modified/deleted in working dir),
-// and untracked (present in working dir but not in index).
-// Returns 0.
-int index_status(const Index *index) {
-    printf("Staged changes:\n");
-    int staged_count = 0;
-    // Note: A true Git implementation deeply diffs against the HEAD tree here. 
-    // For this lab, displaying indexed files represents the staging intent.
-    for (int i = 0; i < index->count; i++) {
-        printf("  staged:     %s\n", index->entries[i].path);
-        staged_count++;
-    }
-    if (staged_count == 0) printf("  (nothing to show)\n");
-    printf("\n");
-
-    printf("Unstaged changes:\n");
-    int unstaged_count = 0;
-    for (int i = 0; i < index->count; i++) {
-        struct stat st;
-        if (stat(index->entries[i].path, &st) != 0) {
-            printf("  deleted:    %s\n", index->entries[i].path);
-            unstaged_count++;
-        } else {
-            // Fast diff: check metadata instead of re-hashing file content
-            if (st.st_mtime != (time_t)index->entries[i].mtime_sec || st.st_size != (off_t)index->entries[i].size) {
-                printf("  modified:   %s\n", index->entries[i].path);
-                unstaged_count++;
-            }
-        }
-    }
-    if (unstaged_count == 0) printf("  (nothing to show)\n");
-    printf("\n");
-
-    printf("Untracked files:\n");
-    int untracked_count = 0;
-    DIR *dir = opendir(".");
-    if (dir) {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            // Skip hidden directories, parent directories, and build artifacts
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-            if (strcmp(ent->d_name, ".pes") == 0) continue;
-            if (strcmp(ent->d_name, "pes") == 0) continue; // compiled executable
-            if (strstr(ent->d_name, ".o") != NULL) continue; // object files
-
-            // Check if file is tracked in the index
-            int is_tracked = 0;
-            for (int i = 0; i < index->count; i++) {
-                if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    is_tracked = 1; 
-                    break;
-                }
-            }
-            
-            if (!is_tracked) {
-                struct stat st;
-                stat(ent->d_name, &st);
-                if (S_ISREG(st.st_mode)) { // Only list regular files for simplicity
-                    printf("  untracked:  %s\n", ent->d_name);
-                    untracked_count++;
-                }
-            }
-        }
-        closedir(dir);
-    }
-    if (untracked_count == 0) printf("  (nothing to show)\n");
-    printf("\n");
-
     return 0;
 }
 
-// ─── TODO: Implement these ───────────────────────────────────────────────────
-
-// Load the index from .pes/index.
-//
-// HINTS - Useful functions:
-//   - fopen (with "r"), fscanf, fclose : reading the text file line by line
-//   - hex_to_hash                      : converting the parsed string to ObjectID
-//
-// Returns 0 on success, -1 on error.
-int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+    unsigned int hash_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
 }
 
-// Save the index to .pes/index atomically.
-//
-// HINTS - Useful functions and syscalls:
-//   - qsort                            : sorting the entries array by path
-//   - fopen (with "w"), fprintf        : writing to the temporary file
-//   - hash_to_hex                      : converting ObjectID for text output
-//   - fflush, fileno, fsync, fclose    : flushing userspace buffers and syncing to disk
-//   - rename                           : atomically moving the temp file over the old index
-//
-// Returns 0 on success, -1 on error.
-int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+void object_path(const ObjectID *id, char *path_out, size_t path_size) {
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id, hex);
+    snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
 }
 
-// Stage a file for the next commit.
-//
-// HINTS - Useful functions and syscalls:
-//   - fopen, fread, fclose             : reading the target file's contents
-//   - object_write                     : saving the contents as OBJ_BLOB
-//   - stat / lstat                     : getting file metadata (size, mtime, mode)
-//   - index_find                       : checking if the file is already staged
-//
-// Returns 0 on success, -1 on error.
-int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+int object_exists(const ObjectID *id) {
+    char path[512];
+    object_path(id, path, sizeof(path));
+    return access(path, F_OK) == 0;
+}
+
+// ───────────────── INTERNAL HELPERS ─────────────────
+
+static int ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return 0;
+    return mkdir(path, 0755);
+}
+
+// ───────────────── OBJECT WRITE ─────────────────
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
+    char header[128];
+
+    const char *type_str =
+        (type == OBJ_BLOB) ? "blob" :
+        (type == OBJ_TREE) ? "tree" : "commit";
+
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    size_t total_size = header_len + len;
+    char *buffer = malloc(total_size);
+    if (!buffer) return -1;
+
+    memcpy(buffer, header, header_len);
+    memcpy(buffer + header_len, data, len);
+
+    // compute hash of FULL object
+    compute_hash(buffer, total_size, id_out);
+
+    if (object_exists(id_out)) {
+        free(buffer);
+        return 0;
+    }
+
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
+
+    ensure_dir(OBJECTS_DIR);
+    ensure_dir(dir_path);
+
+    char final_path[512];
+    object_path(id_out, final_path, sizeof(final_path));
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
+
+    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(buffer);
+        return -1;
+    }
+
+    if (write(fd, buffer, total_size) != (ssize_t)total_size) {
+        close(fd);
+        free(buffer);
+        return -1;
+    }
+
+    fsync(fd);
+    close(fd);
+
+    if (rename(tmp_path, final_path) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    int dir_fd = open(dir_path, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(buffer);
+    return 0;
+}
+
+// ───────────────── OBJECT READ ─────────────────
+
+int object_read(const ObjectID *id, ObjectType *type_out,
+                void **data_out, size_t *len_out) {
+
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buffer = malloc(size);
+    if (!buffer) {
+        fclose(f);
+        return -1;
+    }
+
+    fread(buffer, 1, size, f);
+    fclose(f);
+
+    ObjectID check;
+    compute_hash(buffer, size, &check);
+
+    if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    char *sep = memchr(buffer, '\0', size);
+    if (!sep) {
+        free(buffer);
+        return -1;
+    }
+
+    size_t header_len = sep - buffer;
+
+    if (strncmp(buffer, "blob", 4) == 0) *type_out = OBJ_BLOB;
+    else if (strncmp(buffer, "tree", 4) == 0) *type_out = OBJ_TREE;
+    else *type_out = OBJ_COMMIT;
+
+    size_t data_len = size - header_len - 1;
+
+    *data_out = malloc(data_len);
+    memcpy(*data_out, buffer + header_len + 1, data_len);
+    *len_out = data_len;
+
+    free(buffer);
+    return 0;
 }
